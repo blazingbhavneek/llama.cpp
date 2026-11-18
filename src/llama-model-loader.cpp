@@ -1057,7 +1057,13 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 GGML_ASSERT(n_ids_used > 0);
                 ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
                 ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
-                op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
+                if (w->type == GGML_TYPE_RVQ2X8) {
+                    auto * gains = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, w->ne[1], w->ne[2]);
+                    auto * book  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 256, 2);
+                    op_tensor = ggml_mul_mat_id_rvq(ctx, w, b, ids, gains, book, 0);
+                } else {
+                    op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
+                }
             } break;
         case GGML_OP_ADD:
             {
@@ -1290,6 +1296,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             op = GGML_OP_MUL_MAT_ID;
         } else {
             op = info.op;
+        }
+
+        if (t_meta->type == GGML_TYPE_RVQ2X8 && (get_arch() != LLM_ARCH_INKLING2 || op != GGML_OP_MUL_MAT_ID)) {
+            throw std::runtime_error(format("unsupported RVQ2X8 tensor '%s'", t_meta->name));
         }
 
         // sanity checks

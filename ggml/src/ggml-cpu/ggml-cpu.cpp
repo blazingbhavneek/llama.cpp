@@ -439,6 +439,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         }
     }
 
+    if (src0 && src0->type == GGML_TYPE_RVQ2X8) {
+        return op->op == GGML_OP_MUL_MAT_ID && op->src[3] && op->src[4];
+    }
+
     switch (op->op) {
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:

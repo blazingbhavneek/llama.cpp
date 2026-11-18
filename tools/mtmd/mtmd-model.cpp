@@ -40,6 +40,8 @@ struct mtmd_model_loader {
     bool has_vision    = false;
     bool has_audio     = false;
     bool has_gen_audio = false;
+    int shikigami_grid = 0;
+    std::map<std::string, std::string> shikigami_names;
 
     mtmd_progress_callback progress_callback = nullptr;
     void * progress_callback_user_data = nullptr;
@@ -64,6 +66,7 @@ struct mtmd_model_loader {
         }
 
         ctx_meta.reset(meta);
+        load_shikigami_layout();
 
         const int n_tensors = gguf_get_n_tensors(ctx_gguf.get());
 
@@ -111,6 +114,87 @@ struct mtmd_model_loader {
                 LOG_DBG("%s: tensor[%d]: n_dims = %d, name = %s, tensor_size=%zu, offset=%zu, shape:[%" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 "], type = %s\n",
                     __func__, i, ggml_n_dims(cur), cur->name, tensor_size, offset, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3], ggml_type_name(type));
             }
+        }
+    }
+
+    void load_shikigami_layout() {
+        const int64_t arch_id = gguf_find_key(ctx_gguf.get(), "general.architecture");
+        if (arch_id < 0 || gguf_get_kv_type(ctx_gguf.get(), arch_id) != GGUF_TYPE_STRING ||
+                std::strcmp(gguf_get_val_str(ctx_gguf.get(), arch_id), "inkling2_vision") != 0) {
+            return;
+        }
+
+        const std::string base = "inkling2_vision.";
+        auto * gguf = ctx_gguf.get();
+        int patch = 0, merge = 0, n_layers = 0;
+        get_u32(base + "patch_size", patch);
+        get_u32(base + "spatial_merge_size", merge);
+        get_u32(base + "posemb_grid_size", shikigami_grid);
+        get_u32(base + "block_count", n_layers);
+        if (patch != 20 || merge != 2 || shikigami_grid <= 0 || shikigami_grid > INT32_MAX / patch ||
+                n_layers <= 0 || n_layers > gguf_get_n_tensors(gguf) / 18) {
+            throw std::runtime_error("invalid Shikigami vision dimensions");
+        }
+
+        gguf_set_val_bool(gguf, KEY_HAS_VISION_ENC, true);
+        gguf_set_val_str(gguf, KEY_PROJ_TYPE, "inkling2");
+        gguf_set_val_u32(gguf, KEY_IMAGE_SIZE, patch * shikigami_grid);
+        gguf_set_val_u32(gguf, KEY_PATCH_SIZE, patch);
+        gguf_set_val_u32(gguf, KEY_PROJ_SCALE_FACTOR, merge);
+        gguf_set_val_u32(gguf, mtmd_format(KEY_N_BLOCK, "vision").c_str(), n_layers);
+
+        auto copy_u32 = [&](const char * from, const char * to) {
+            int value = 0;
+            get_u32(base + from, value);
+            if (value <= 0) {
+                throw std::runtime_error("invalid Shikigami vision key " + base + from);
+            }
+            gguf_set_val_u32(gguf, mtmd_format(to, "vision").c_str(), value);
+        };
+        copy_u32("embedding_length", KEY_N_EMBD);
+        copy_u32("feed_forward_length", KEY_N_FF);
+        copy_u32("attention.head_count", KEY_N_HEAD);
+        copy_u32("text_embedding_length", KEY_PROJ_DIM);
+
+        float eps = 0.0f;
+        get_f32(base + "attention.layer_norm_epsilon", eps);
+        gguf_set_val_f32(gguf, mtmd_format(KEY_LAYER_NORM_EPS, "vision").c_str(), eps);
+        std::vector<float> mean, stddev;
+        get_arr_f32(base + "image_mean", mean);
+        get_arr_f32(base + "image_std", stddev);
+        if (mean.size() != 3 || stddev.size() != 3 ||
+                std::any_of(stddev.begin(), stddev.end(), [](float value) { return !std::isfinite(value) || value <= 0.0f; })) {
+            throw std::runtime_error("invalid Shikigami image normalization");
+        }
+        gguf_set_arr_data(gguf, KEY_IMAGE_MEAN, GGUF_TYPE_FLOAT32, mean.data(), mean.size());
+        gguf_set_arr_data(gguf, KEY_IMAGE_STD, GGUF_TYPE_FLOAT32, stddev.data(), stddev.size());
+
+        shikigami_names = {
+            { "v.class_embd",         "vision_tower.embeddings.class_embedding" },
+            { "v.class_pos_embd",     "vision_tower.embeddings.cls_position_embedding" },
+            { "v.patch_embd.weight",  "vision_tower.embeddings.patch_embedding.weight" },
+            { "v.position_embd.weight", "vision_tower.embeddings.position_embedding.weight" },
+            { "v.pre_ln.weight",      "vision_tower.pre_layernorm.weight" },
+            { "v.pre_ln.bias",        "vision_tower.pre_layernorm.bias" },
+            { "mm.up.weight",         "vision_tower.merger.linear_1.weight" },
+            { "mm.down.weight",       "vision_tower.merger.linear_2.weight" },
+        };
+        const std::pair<const char *, const char *> layer_names[] = {
+            { "attn_q", "self_attn.q_proj" }, { "attn_k", "self_attn.k_proj" },
+            { "attn_v", "self_attn.v_proj" }, { "attn_out", "self_attn.out_proj" },
+            { "ln1", "layernorm_before" }, { "ln2", "layernorm_after" },
+            { "ffn_up", "mlp.fc1" }, { "ffn_down", "mlp.fc2" },
+        };
+        for (int i = 0; i < n_layers; ++i) {
+            const std::string dst = "v.blk." + std::to_string(i) + ".";
+            const std::string src = "vision_tower.layers." + std::to_string(i) + ".";
+            for (const auto & [to, from] : layer_names) {
+                for (const char * suffix : { ".weight", ".bias" }) {
+                    shikigami_names.emplace(dst + to + suffix, src + from + suffix);
+                }
+            }
+            shikigami_names.emplace(dst + "ls1.weight", src + "lambda_1");
+            shikigami_names.emplace(dst + "ls2.weight", src + "lambda_2");
         }
     }
 
@@ -293,6 +377,31 @@ struct mtmd_model_loader {
 
             // model-specific params
             switch (model.proj_type) {
+                case PROJECTOR_TYPE_INKLING2:
+                    {
+                        hparams.ffn_op = FFN_GELU_ERF;
+                        hparams.inkling2_shikigami = shikigami_grid > 0;
+                        log_ffn_op = "gelu_erf";
+                        hparams.rope_theta = 10000.0f;
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
+                        hparams.image_resize_pad  = PAD_NONE;
+                        hparams.warmup_image_size = 640;
+                    } break;
+                case PROJECTOR_TYPE_INKLING:
+                    {
+                        if (is_vision) {
+                            hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                            hparams.image_resize_pad  = PAD_NONE;
+                            hparams.warmup_image_size = hparams.patch_size;
+                        } else {
+                            hparams.audio_chunk_len   = 0;
+                            hparams.audio_sample_rate = 16000;
+                            hparams.audio_n_fft       = 1600;
+                            hparams.audio_window_len  = 1600;
+                            hparams.audio_hop_len     = 800;
+                            hparams.warmup_audio_size = 4;
+                        }
+                    } break;
                 case PROJECTOR_TYPE_MLP:
                 case PROJECTOR_TYPE_MLP_NORM:
                 case PROJECTOR_TYPE_LDP:
@@ -1357,13 +1466,37 @@ struct mtmd_model_loader {
             if (loaded_tensor_names.count(name)) {
                 throw std::runtime_error(mtmd_format("%s: tensor already loaded: %s\n", __func__, name.c_str()));
             }
-            ggml_tensor * cur = ggml_get_tensor(ctx_meta.get(), name.c_str());
+            const auto alias = shikigami_names.find(name);
+            const auto & source_name = alias == shikigami_names.end() ? name : alias->second;
+            ggml_tensor * cur = ggml_get_tensor(ctx_meta.get(), source_name.c_str());
             if (!cur && required) {
                 throw std::runtime_error(mtmd_format("%s: unable to find tensor %s\n", __func__, name.c_str()));
             }
             if (cur) {
                 tensors_to_load.push_back(cur);
-                ggml_tensor * data_tensor = ggml_dup_tensor(model.ctx_data.get(), cur);
+                ggml_context * ctx = model.ctx_data.get();
+                ggml_tensor * data_tensor = nullptr;
+                if (alias == shikigami_names.end()) {
+                    data_tensor = ggml_dup_tensor(ctx, cur);
+                } else if (cur->type != GGML_TYPE_BF16) {
+                    throw std::runtime_error("expected BF16 Shikigami tensor " + source_name);
+                } else if (name == TN_PATCH_EMBD) {
+                    const int64_t p = hparams.patch_size;
+                    if (cur->ne[0] != 3 * p * p || cur->ne[1] != hparams.n_embd || !ggml_is_matrix(cur)) {
+                        throw std::runtime_error("invalid Shikigami patch embedding shape");
+                    }
+                    data_tensor = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, p, p, 3, cur->ne[1]);
+                } else if (name == mtmd_format(TN_POS_EMBD, "v")) {
+                    const int64_t grid = shikigami_grid;
+                    if (cur->ne[0] != hparams.n_embd || cur->ne[1] != grid * grid || !ggml_is_matrix(cur)) {
+                        throw std::runtime_error("invalid Shikigami position embedding shape");
+                    }
+                    data_tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cur->ne[0], grid, grid);
+                } else if (ggml_is_vector(cur)) {
+                    data_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cur->ne[0]);
+                } else {
+                    data_tensor = ggml_dup_tensor(ctx, cur);
+                }
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
@@ -1469,6 +1602,7 @@ struct mtmd_model_loader {
 
         const bool has_standard_layers = (
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
+            model.proj_type != PROJECTOR_TYPE_INKLING &&
             model.proj_type != PROJECTOR_TYPE_QWEN3TTS_SPKENC &&
             model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN &&
             model.proj_type != PROJECTOR_TYPE_SOPRANO &&
@@ -1664,6 +1798,30 @@ struct mtmd_model_loader {
         };
 
         switch (model.proj_type) {
+            case PROJECTOR_TYPE_INKLING2:
+                {
+                    GGML_ASSERT(model.class_embedding && model.position_embeddings && model.patch_embeddings_0);
+                    model.inkling2_cls_pos = get_tensor(TN_INKLING2_CLS_POS);
+                    model.mm_ffn_up_w      = get_tensor(mtmd_format(TN_MM_UP,   "weight"));
+                    model.mm_ffn_down_w    = get_tensor(mtmd_format(TN_MM_DOWN, "weight"));
+                } break;
+            case PROJECTOR_TYPE_INKLING:
+                {
+                    if (model.modality == MTMD_MODALITY_VISION) {
+                        model.inkling_hmlp_layers.resize(hparams.n_layer);
+                        for (int il = 0; il < hparams.n_layer; ++il) {
+                            auto & layer = model.inkling_hmlp_layers[il];
+                            layer.linear_w = get_tensor(mtmd_format(TN_INKLING_HMLP_LINEAR, il));
+                            layer.norm_w = il + 1 < hparams.n_layer
+                                ? get_tensor(mtmd_format(TN_INKLING_HMLP_NORM, il))
+                                : nullptr;
+                        }
+                        model.inkling_hmlp_final_norm_w = get_tensor(TN_INKLING_HMLP_FINAL_NORM);
+                    } else {
+                        model.inkling_dmel_embd_w       = get_tensor(TN_INKLING_DMEL_EMBD);
+                        model.inkling_dmel_final_norm_w = get_tensor(TN_INKLING_DMEL_FINAL_NORM);
+                    }
+                } break;
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:
                 {
@@ -3514,6 +3672,9 @@ struct mtmd_model_loader {
         // load data
         {
             std::vector<uint8_t> read_buf;
+            std::vector<ggml_bf16_t> bf16_buf;
+            std::vector<float> f32_buf;
+            std::vector<ggml_fp16_t> f16_buf;
 
             // start loading event
             if (progress_callback){
@@ -3542,8 +3703,32 @@ struct mtmd_model_loader {
                     if (!fin) {
                         throw std::runtime_error(mtmd_format("%s: failed to seek for tensor %s\n", __func__, t->name));
                     }
-                    size_t num_bytes = ggml_nbytes(cur);
-                    if (ggml_backend_buft_is_host(buft)) {
+                    const size_t num_bytes = ggml_nbytes(t);
+                    if (shikigami_grid && t->type == GGML_TYPE_BF16 && cur->type != GGML_TYPE_BF16) {
+                        bf16_buf.resize(ggml_nelements(t));
+                        if (!fin.read(reinterpret_cast<char *>(bf16_buf.data()), num_bytes)) {
+                            throw std::runtime_error(std::string("truncated Shikigami tensor ") + t->name);
+                        }
+                        if (cur->type == GGML_TYPE_F32) {
+                            f32_buf.resize(bf16_buf.size());
+                            ggml_bf16_to_fp32_row(bf16_buf.data(), f32_buf.data(), bf16_buf.size());
+                            ggml_backend_tensor_set(cur, f32_buf.data(), 0, ggml_nbytes(cur));
+                        } else {
+                            // The source stores each pixel's channels together, while conv2d expects planar channels.
+                            f16_buf.resize(bf16_buf.size());
+                            const int64_t pixels = cur->ne[0] * cur->ne[1];
+                            for (int64_t patch = 0; patch < cur->ne[3]; ++patch) {
+                                const int64_t base = patch * 3 * pixels;
+                                for (int64_t pixel = 0; pixel < pixels; ++pixel) {
+                                    for (int c = 0; c < 3; ++c) {
+                                        f16_buf[base + c * pixels + pixel] =
+                                            ggml_fp32_to_fp16(ggml_bf16_to_fp32(bf16_buf[base + 3 * pixel + c]));
+                                    }
+                                }
+                            }
+                            ggml_backend_tensor_set(cur, f16_buf.data(), 0, ggml_nbytes(cur));
+                        }
+                    } else if (ggml_backend_buft_is_host(buft)) {
                         // for the CPU and Metal backend, we can read directly into the tensor
                         fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
                     } else {
@@ -3857,6 +4042,16 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
     projector_type proj = proj_type;
 
     switch (proj) {
+        case PROJECTOR_TYPE_INKLING:
+            {
+                if (modality == MTMD_MODALITY_AUDIO) {
+                    // One dMel row is one soft audio token.
+                    n_patches = img->nx();
+                } else {
+                    // Batch entries are temporal slices; each pair emits one token.
+                    n_patches = 1;
+                }
+            } break;
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
@@ -3961,6 +4156,7 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_KIMIK25:
         case PROJECTOR_TYPE_KIMIK31:
+        case PROJECTOR_TYPE_INKLING2:
             {
                 // dynamic size
                 int out_patch_size = params.patch_size * hparams.n_merge;
@@ -4222,6 +4418,10 @@ size_t mtmd_model::cbx_read_tensor(const char * name, float * out, size_t n_max)
 
 int mtmd_model::n_mmproj_embd() const {
     switch (proj_type) {
+        case PROJECTOR_TYPE_INKLING:
+            return modality == MTMD_MODALITY_AUDIO
+                ? inkling_dmel_final_norm_w->ne[0]
+                : inkling_hmlp_final_norm_w->ne[0];
         case PROJECTOR_TYPE_LDP:
             return mm_model_block_1_block_2_1_b->ne[0];
         case PROJECTOR_TYPE_LDPV2:
@@ -4241,6 +4441,7 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
         case PROJECTOR_TYPE_MINICPM_OCR_1_0:
+        case PROJECTOR_TYPE_INKLING2:
             return mm_ffn_down_w->ne[1];
         case PROJECTOR_TYPE_GLM_EDGE:
             return mm_model_mlp_3_w->ne[1];

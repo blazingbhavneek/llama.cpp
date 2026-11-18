@@ -80,6 +80,7 @@ struct mtmd_hparams {
     // 0 = derive from n_embd; set when qkv width != n_embd
     int32_t n_embd_head = 0;
     int32_t n_layer = 0;
+    bool inkling2_shikigami = false;
     int32_t n_merge = 1; // number of patch merges **per-side**
 
     // for preprocessor
@@ -506,6 +507,11 @@ struct qf_block {
     std::vector<mtmd_layer> qf_proj_layers;
 };
 
+struct inkling_hmlp_layer {
+    ggml_tensor * linear_w = nullptr;
+    ggml_tensor * norm_w   = nullptr;
+};
+
 // pocket-tts SEANet stack, used in both directions:
 // encoder = conv_in -> per stage (residual unit, strided conv) -> conv_out
 // decoder = conv_in -> per stage (strided convtr, residual unit) -> conv_out
@@ -905,6 +911,14 @@ struct mtmd_model {
     ggml_tensor * rope_freqs = nullptr;
     ggml_tensor * norm_embd_w = nullptr;
     ggml_tensor * norm_embd_b = nullptr;
+
+    // Inkling towers (neither uses standard transformer blocks).
+    std::vector<inkling_hmlp_layer> inkling_hmlp_layers;
+    ggml_tensor * inkling_hmlp_final_norm_w = nullptr;
+    ggml_tensor * inkling_dmel_embd_w        = nullptr;
+    ggml_tensor * inkling_dmel_final_norm_w  = nullptr;
+
+    ggml_tensor * inkling2_cls_pos = nullptr;
 
     // "indexed" patch embedding norms
     ggml_tensor * patch_norm_1_w = nullptr;

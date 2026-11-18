@@ -637,6 +637,12 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 }
 
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+    [GGML_TYPE_RVQ2X8] = {
+        .type_name                = "rvq2x8",
+        .blck_size                = 8,
+        .type_size                = sizeof(uint16_t),
+        .is_quantized             = true,
+    },
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
         .blck_size                = 1,
@@ -1080,6 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FILL",
 
     "FLASH_ATTN_EXT",
+    "FLASH_ATTN_EXT_BANDED",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1114,7 +1121,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1193,6 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "fill(x, c)",
 
     "flash_attn_ext(x)",
+    "flash_attn_ext_banded(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1227,7 +1235,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3280,6 +3288,7 @@ bool ggml_prec_set_acc(
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {
                 const int32_t prec_i32 = (int32_t) prec;
                 ggml_set_op_params_i32(a, 3, prec_i32);
@@ -3423,6 +3432,30 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[1] = b;
     result->src[2] = ids;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_id_rvq(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * codes,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * gains,
+        struct ggml_tensor  * book,
+        int32_t               expert_offset) {
+    GGML_ASSERT(codes->type == GGML_TYPE_RVQ2X8 && ggml_is_contiguous(codes));
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->nb[0] == sizeof(float));
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(gains->type == GGML_TYPE_F16 && ggml_is_contiguous(gains));
+    GGML_ASSERT(gains->ne[0] == codes->ne[1] && gains->ne[1] == codes->ne[2] && ggml_is_matrix(gains));
+    GGML_ASSERT(book->type == GGML_TYPE_F32 && ggml_is_contiguous(book));
+    GGML_ASSERT(book->ne[0] == 8 && book->ne[1] == 256 && book->ne[2] == 2 && book->ne[3] == 1);
+    GGML_ASSERT(expert_offset >= 0);
+
+    struct ggml_tensor * result = ggml_mul_mat_id(ctx, codes, b, ids);
+    result->src[3] = gains;
+    result->src[4] = book;
+    ggml_set_op_params_i32(result, 4, expert_offset);
     return result;
 }
 
@@ -5460,6 +5493,55 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_banded(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * rel_logits,
+        float                 scale,
+        int64_t               rel_extent) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
+
+    GGML_ASSERT(rel_logits != NULL);
+    GGML_ASSERT(rel_logits->type == GGML_TYPE_F32 ||
+                rel_logits->type == GGML_TYPE_F16 ||
+                rel_logits->type == GGML_TYPE_BF16);
+    GGML_ASSERT(rel_extent > 0);
+    GGML_ASSERT(rel_logits->ne[0] == rel_extent);
+    GGML_ASSERT(rel_logits->ne[1] == q->ne[2]);
+    GGML_ASSERT(rel_logits->ne[2] == q->ne[1]);
+    GGML_ASSERT(rel_logits->ne[3] == 1 || rel_logits->ne[3] == q->ne[3]);
+
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
+    }
+
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, 0.0f, 0.0f };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_BANDED;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[6] = rel_logits;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5488,7 +5570,7 @@ struct ggml_tensor * ggml_flash_attn_ext_rows(
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 
@@ -5512,10 +5594,12 @@ void ggml_flash_attn_ext_add_sinks(
         return;
     }
 
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
     GGML_ASSERT(a->src[4] == NULL);
     GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(sinks) == sinks->ne[0] || (a->op == GGML_OP_FLASH_ATTN_EXT_BANDED &&
+                sinks->ne[1] == a->src[0]->ne[1] && (sinks->ne[2] == 1 || sinks->ne[2] == a->src[0]->ne[3])));
 
     a->src[4] = sinks;
 }

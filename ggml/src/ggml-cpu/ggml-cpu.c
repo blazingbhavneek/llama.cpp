@@ -1563,6 +1563,51 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+static void ggml_compute_forward_mul_mat_id_rvq(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * codes = dst->src[0];
+    const struct ggml_tensor * x     = dst->src[1];
+    const struct ggml_tensor * ids   = dst->src[2];
+    const struct ggml_tensor * gains = dst->src[3];
+    const float * book = dst->src[4]->data;
+    const struct ggml_tensor * lookup = dst->src[5];
+    const int32_t offset = ggml_get_op_params_i32(dst, 4);
+
+    const int64_t rows = dst->ne[0];
+    const int64_t slots = dst->ne[1];
+    for (int64_t i = params->ith; i < ggml_nelements(dst); i += params->nth) {
+        const int64_t row = i % rows;
+        const int64_t slot = i / rows % slots;
+        const int64_t token = i / (rows * slots);
+        const int32_t * token_ids = (const int32_t *) ((const char *) ids->data + token * ids->nb[1]);
+        const int64_t expert = (int64_t) token_ids[slot] - offset;
+
+        float sum = 0.0f;
+        if (expert >= 0 && expert < codes->ne[2]) {
+            const uint16_t * w = (const uint16_t *) ((const char *) codes->data + expert * codes->nb[2] + row * codes->nb[1]);
+            if (lookup) {
+                const float * table = (const float *) lookup->data + (token * x->ne[1] + slot % x->ne[1]) * codes->ne[0] / 8 * 512;
+                for (int64_t j = 0; j < codes->ne[0] / 8; ++j, table += 512) {
+                    sum += table[w[j] >> 8] + table[256 + (w[j] & 255)];
+                }
+            } else {
+                const float * a = (const float *) ((const char *) x->data + token * x->nb[2] + (slot % x->ne[1]) * x->nb[1]);
+                for (int64_t j = 0; j < codes->ne[0] / 8; ++j) {
+                    const float * first  = book + 8 * (w[j] >> 8);
+                    const float * second = book + 8 * (256 + (w[j] & 255));
+                    for (int k = 0; k < 8; ++k) {
+                        sum += a[8*j + k] * (first[k] + second[k]);
+                    }
+                }
+            }
+            const ggml_fp16_t * gain = (const ggml_fp16_t *) gains->data;
+            sum *= GGML_CPU_FP16_TO_FP32(gain[expert * rows + row]);
+        }
+        ((float *) dst->data)[i] = sum;
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1884,7 +1929,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
-                ggml_compute_forward_mul_mat_id(params, tensor);
+                if (tensor->src[0]->type == GGML_TYPE_RVQ2X8) {
+                    ggml_compute_forward_mul_mat_id_rvq(params, tensor);
+                } else {
+                    ggml_compute_forward_mul_mat_id(params, tensor);
+                }
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2035,6 +2084,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_fill(params, tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
@@ -2436,6 +2486,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -2905,6 +2956,9 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
+                        if (src0->type == GGML_TYPE_RVQ2X8) {
+                            break;
+                        }
                         const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
                         const int n_as = src0->ne[2];
                         // src1
@@ -2994,6 +3048,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
+                case GGML_OP_FLASH_ATTN_EXT_BANDED:
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
                         const int64_t DK = node->src[1]->ne[0];
